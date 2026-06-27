@@ -56,13 +56,20 @@ defmodule Muex.Mutator do
 
   The `:equivalent` key is optional. When `true`, the mutation is considered
   semantically equivalent to the original and will be filtered out by the optimizer.
+
+  `:original_ast` and `:context_ast` are attached by `walk/3`. `:original_ast` is
+  the exact node that was mutated; `:context_ast` is the enclosing function
+  definition (when the mutation occurs inside one), so heuristics can judge a
+  mutation against the surrounding code rather than the isolated fragment.
   """
   @type mutation :: %{
-          ast: term(),
-          original_ast: term(),
-          mutator: module(),
-          description: String.t(),
-          location: %{file: String.t(), line: non_neg_integer()}
+          :ast => term(),
+          :mutator => module(),
+          :description => String.t(),
+          :location => %{file: String.t(), line: non_neg_integer()},
+          optional(:original_ast) => term(),
+          optional(:context_ast) => term(),
+          optional(:equivalent) => boolean()
         }
 
   @doc """
@@ -147,18 +154,50 @@ defmodule Muex.Mutator do
   """
   @spec walk(ast :: term(), mutators :: [module()], context :: map()) :: [mutation()]
   def walk(ast, mutators, context) do
-    {_ast, mutations} =
-      Macro.prewalk(ast, [], fn node, acc ->
-        node_mutations =
-          Enum.flat_map(mutators, fn mutator ->
-            node
-            |> mutator.mutate(context)
-            |> Enum.map(&Map.put(&1, :original_ast, node))
-          end)
-
-        {node, acc ++ node_mutations}
-      end)
+    {_ast, %{mutations: mutations}} =
+      Macro.traverse(
+        ast,
+        %{mutations: [], scope: []},
+        fn node, acc -> {node, enter_node(node, acc, mutators, context)} end,
+        fn node, acc -> {node, leave_node(node, acc)} end
+      )
 
     mutations
   end
+
+  # Pre-order: push the function definition onto the scope stack so any mutation
+  # generated inside it (including nested expressions and anonymous functions)
+  # records the surrounding function as `:context_ast`.
+  defp enter_node(node, acc, mutators, context) do
+    scope = if function_def?(node), do: [node | acc.scope], else: acc.scope
+    enclosing = List.first(scope)
+
+    node_mutations =
+      Enum.flat_map(mutators, fn mutator ->
+        node
+        |> mutator.mutate(context)
+        |> Enum.map(&annotate(&1, node, enclosing))
+      end)
+
+    %{acc | mutations: acc.mutations ++ node_mutations, scope: scope}
+  end
+
+  # Post-order: leaving the function definition we entered, so pop it back off.
+  defp leave_node(node, acc) do
+    if function_def?(node), do: %{acc | scope: tl(acc.scope)}, else: acc
+  end
+
+  defp annotate(mutation, node, nil), do: Map.put(mutation, :original_ast, node)
+
+  defp annotate(mutation, node, enclosing) do
+    mutation
+    |> Map.put(:original_ast, node)
+    |> Map.put(:context_ast, enclosing)
+  end
+
+  defp function_def?({kind, _meta, [_signature, body]})
+       when kind in [:def, :defp, :defmacro, :defmacrop] and is_list(body),
+       do: Keyword.has_key?(body, :do)
+
+  defp function_def?(_), do: false
 end
