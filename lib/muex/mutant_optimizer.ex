@@ -28,10 +28,11 @@ defmodule Muex.MutantOptimizer do
   """
 
   @type mutation :: %{
-          ast: tuple(),
-          mutator: module(),
-          description: String.t(),
-          location: map()
+          :ast => tuple(),
+          :mutator => module(),
+          :description => String.t(),
+          :location => map(),
+          optional(:context_ast) => term()
         }
 
   @type filter_options :: [
@@ -272,8 +273,17 @@ defmodule Muex.MutantOptimizer do
 
   defp has_multiple_operations?(_), do: false
 
+  # Judge complexity from the enclosing function (attached by `Mutator.walk/3`)
+  # rather than the isolated mutated fragment. An arithmetic, comparison, literal,
+  # or function-call fragment has no decision points of its own, so estimating
+  # from it would assign every such mutation complexity 1 and filter them all out
+  # at the default level — silently discarding most of the test suite's mutants.
+  defp estimate_complexity(%{context_ast: context_ast}) when not is_nil(context_ast) do
+    count_decision_points(context_ast) + 1
+  end
+
   defp estimate_complexity(%{ast: ast}) do
-    # Calculate cyclomatic complexity approximation
+    # Fallback for mutations outside any function definition (e.g. module-level).
     count_decision_points(ast) + 1
   end
 
@@ -294,6 +304,12 @@ defmodule Muex.MutantOptimizer do
       |> Enum.sum()
 
     current + children
+  end
+
+  # Two-element tuples carry `do:`/`else:` blocks (and literal pairs); descend
+  # into both elements so conditionals nested inside a function body are counted.
+  defp count_decision_points({left, right}) do
+    count_decision_points(left) + count_decision_points(right)
   end
 
   defp count_decision_points(ast) when is_tuple(ast), do: 0
